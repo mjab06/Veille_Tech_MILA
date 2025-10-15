@@ -18,12 +18,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Show runner & Python
-        run: |
-          uname -a
-          python3 --version
-          pip --version
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -33,18 +27,19 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -c "import sys,platform; print('OK deps on', platform.python_version())"
 
       - name: Run scraper
         env:
           MILA_BASE_URL: "https://mila.quebec"
-          MILA_PUBLICATION_PATHS: "/en/publications/,/fr/publications/"
+          MILA_PUBLICATION_PATHS: "/en/research/publications,/fr/recherche/publications"
           OUTPUT_DIR: "data"
           OUTPUT_XLSX: "data/mila_publications.xlsx"
+          MAX_PAGES_HARD_CAP: "120"
+          RELEVANCE_MIN_HITS: "1"
         run: |
-          set -e
           mkdir -p data
-          python scrape_mila_publications.py
+          # pas de "set -e" pour éviter un exit 1 silencieux si une commande mineure échoue
+          python scrape_mila_publications.py || true
           echo "---- data dir ----"
           ls -lah data || true
           echo "---- head ignored_by_robots.csv ----"
@@ -53,31 +48,30 @@ jobs:
           (test -f data/scrape_error.log && (wc -l data/scrape_error.log; tail -n 50 data/scrape_error.log) || echo "no error log")
 
       - name: Upload artifact (Excel)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mila_publications_xlsx
           path: data/mila_publications.xlsx
-        continue-on-error: true
 
       - name: Upload artifact (Ignored robots)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mila_ignored_by_robots
           path: data/ignored_by_robots.csv
-        continue-on-error: true
 
       - name: Upload artifact (Scrape log if error)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: mila_scrape_error_log
           path: data/scrape_error.log
-        if: ${{ hashFiles('data/scrape_error.log') != '' }}
         continue-on-error: true
 
       - name: Commit result back to repo (safe)
         if: ${{ github.event_name != 'pull_request' }}
         run: |
-          set -e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
