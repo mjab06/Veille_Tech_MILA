@@ -5,12 +5,24 @@ on:
   schedule:
     - cron: "17 6 * * 1"   # chaque lundi 06:17 UTC
 
+permissions:
+  contents: write
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Show runner & Python
+        run: |
+          uname -a
+          python3 --version
+          pip --version
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -21,6 +33,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -c "import sys,platform; print('OK deps on', platform.python_version())"
 
       - name: Run scraper
         env:
@@ -29,26 +42,53 @@ jobs:
           OUTPUT_DIR: "data"
           OUTPUT_XLSX: "data/mila_publications.xlsx"
         run: |
+          set -e
+          mkdir -p data
           python scrape_mila_publications.py
+          echo "---- data dir ----"
+          ls -lah data || true
+          echo "---- head ignored_by_robots.csv ----"
+          (head -n 5 data/ignored_by_robots.csv || true)
+          echo "---- error log (if any) ----"
+          (test -f data/scrape_error.log && (wc -l data/scrape_error.log; tail -n 50 data/scrape_error.log) || echo "no error log")
 
       - name: Upload artifact (Excel)
         uses: actions/upload-artifact@v4
         with:
           name: mila_publications_xlsx
           path: data/mila_publications.xlsx
+        continue-on-error: true
 
       - name: Upload artifact (Ignored robots)
         uses: actions/upload-artifact@v4
         with:
           name: mila_ignored_by_robots
           path: data/ignored_by_robots.csv
+        continue-on-error: true
 
-      # Optionnel: commit des résultats
-      - name: Commit result back to repo
-        if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Upload artifact (Scrape log if error)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mila_scrape_error_log
+          path: data/scrape_error.log
+        if: ${{ hashFiles('data/scrape_error.log') != '' }}
+        continue-on-error: true
+
+      - name: Commit result back to repo (safe)
+        if: ${{ github.event_name != 'pull_request' }}
         run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/mila_publications.xlsx data/ignored_by_robots.csv
-          git commit -m "chore: update MILA publications + robots journal [skip ci]" || echo "No changes to commit"
-          git push
+
+          ADDED=0
+          [ -f "data/mila_publications.xlsx" ] && git add data/mila_publications.xlsx && ADDED=1 || true
+          [ -f "data/ignored_by_robots.csv" ] && git add data/ignored_by_robots.csv && ADDED=1 || true
+          [ -f "data/scrape_error.log" ] && git add data/scrape_error.log && ADDED=1 || true
+
+          if [ "$ADDED" -eq 1 ]; then
+            git commit -m "chore: update MILA publications + robots journal + log [skip ci]" || echo "No changes to commit"
+            git push || echo "Push skipped (branch protections or permissions)."
+          else
+            echo "No files to add; skipping commit/push."
+          fi
