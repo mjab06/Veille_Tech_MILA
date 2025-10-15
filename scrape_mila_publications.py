@@ -2,18 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-Scraper MILA publications -> Excel (focus: rare diseases, HPC/supercomputers, quantum computing, AI in health)
+Scraper MILA publications -> Excel
+- CIBLE: la LISTE paginée /en/research/publications?page=N (server-rendered)
+- Extrait: titre, auteurs, date, venue, type (preprint/published), doi, arxiv/pdf, abstract court, langue, URL (liste)
+- Filtrage par mots-clés (rare diseases, HPC, quantum, AI santé)
+- Respect basique de robots.txt (journal 'ignored_by_robots.csv')
+- Mode fail-soft: génère toujours les artifacts; loggue les erreurs dans data/scrape_error.log
 
-Sorties toujours présentes (même si erreurs):
-  - data/mila_publications.xlsx
-  - data/ignored_by_robots.csv
-  - data/scrape_error.log (uniquement s'il y a des erreurs)
-
-Comportement "fail-soft": en cas d'exception, on journalise et on retourne code 0
-pour que le workflow n'échoue pas (les artifacts servent au diagnostic).
+Réf: La page et son pager "Last page ..." existent (voir site). 
 """
 
-import os, re, time, random, urllib.parse, sys, traceback
+import os, re, sys, time, random, urllib.parse, traceback
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 
@@ -26,21 +25,21 @@ from tqdm import tqdm
 # Configuration
 # -----------------------------
 BASE_URL = os.environ.get("MILA_BASE_URL", "https://mila.quebec")
-PUBLICATION_PATHS = os.environ.get("MILA_PUBLICATION_PATHS", "/en/publications/,/fr/publications/").split(",")
-
+LIST_PATHS = os.environ.get("MILA_PUBLICATION_PATHS", "/en/research/publications").split(",")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "data")
 OUTPUT_XLSX = os.environ.get("OUTPUT_XLSX", os.path.join(OUTPUT_DIR, "mila_publications.xlsx"))
 OUTPUT_IGNORED = os.path.join(OUTPUT_DIR, "ignored_by_robots.csv")
 OUTPUT_ERRLOG = os.path.join(OUTPUT_DIR, "scrape_error.log")
 
 DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; MILA-Publication-Research/1.1; +https://github.com/your-org/your-repo)"
+    "User-Agent": "Mozilla/5.0 (compatible; MILA-Publication-Research/2.0; +https://github.com/your-org/your-repo)"
 }
 TIMEOUT = 30
 MAX_RETRIES = 3
+MAX_PAGES_HARD_CAP = int(os.environ.get("MAX_PAGES_HARD_CAP", "80"))  # sécurité CI: évite 600 pages d’un coup
 
 # -----------------------------
-# Filtrage thématique
+# Thématique
 # -----------------------------
 KEYWORDS = [kw.lower() for kw in [
     # Rare diseases
@@ -71,7 +70,7 @@ COLUMNS = [
 ]
 
 # -----------------------------
-# Session HTTP
+# HTTP Session
 # -----------------------------
 SESSION = requests.Session()
 SESSION.headers.update(DEFAULT_HEADERS)
@@ -79,10 +78,10 @@ SESSION.headers.update(DEFAULT_HEADERS)
 # -----------------------------
 # Robots.txt — cache & journal
 # -----------------------------
-IGNORED_BY_ROBOTS: List[Dict[str, str]] = []   # lignes pour CSV
-ROBOTS_RULES = {"disallow": []}                # règles Disallow pour UA "*"
+IGNORED_BY_ROBOTS: List[Dict[str, str]] = []
+ROBOTS_RULES = {"disallow": []}
 
-def polite_sleep(a=1.0, b=2.0):
+def polite_sleep(a=0.5, b=1.1):
     time.sleep(random.uniform(a, b))
 
 def fetch(url: str) -> Optional[requests.Response]:
@@ -94,44 +93,38 @@ def fetch(url: str) -> Optional[requests.Response]:
                 continue
             if resp.ok:
                 return resp
-            if resp.status_code in (401, 403, 404):
+            if resp.status_code in (401,403,404):
                 return resp
         except requests.RequestException:
             polite_sleep(1, 2 + i)
     return None
 
 def load_robots():
-    """Charge une fois robots.txt et extrait les Disallow du bloc UA *."""
     try:
         robots_url = urllib.parse.urljoin(BASE_URL, "/robots.txt")
         r = fetch(robots_url)
         if not r or not r.ok:
             return
-        disallows = []
-        active = False
+        disallows, active = [], False
         for raw in r.text.splitlines():
             line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
+            if not line or line.startswith("#"): continue
             if line.lower().startswith("user-agent:"):
-                ua = line.split(":", 1)[1].strip()
+                ua = line.split(":",1)[1].strip()
                 active = (ua == "*")
             elif active and line.lower().startswith("disallow:"):
-                path = line.split(":", 1)[1].strip()
-                disallows.append(path)
+                disallows.append(line.split(":",1)[1].strip())
         ROBOTS_RULES["disallow"] = disallows
     except Exception:
         pass
 
 def robots_blocking_rule(path: str) -> Optional[str]:
-    """Retourne la règle Disallow qui bloque ce path, sinon None."""
     for d in ROBOTS_RULES.get("disallow", []):
         if d and path.startswith(d):
             return d
     return None
 
 def can_fetch_robots(url: str) -> Tuple[bool, Optional[str]]:
-    """Renvoie (autorisé, règle_bloquante_ou_None)."""
     try:
         parsed = urllib.parse.urlparse(url)
         rule = robots_blocking_rule(parsed.path or "/")
@@ -140,267 +133,200 @@ def can_fetch_robots(url: str) -> Tuple[bool, Optional[str]]:
         return (True, None)
 
 # -----------------------------
-# Utilitaires parsing
+# Helpers parsing
 # -----------------------------
 def guess_language_from_path(path: str) -> Optional[str]:
     path = path.lower()
-    if path.startswith("/fr/"):
-        return "fr"
-    if path.startswith("/en/") or path.startswith("/en-"):
-        return "en"
+    if path.startswith("/fr/"): return "fr"
+    if path.startswith("/en/") or path.startswith("/en-"): return "en"
     return None
 
 def clean_text(s: Optional[str]) -> str:
-    if not s:
-        return ""
+    if not s: return ""
     return re.sub(r"\s+", " ", s).strip()
 
-def extract_meta(soup: BeautifulSoup) -> Tuple[str, str]:
-    mt = soup.find("meta", attrs={"property": "og:title"}) or soup.find("meta", attrs={"name": "title"})
-    md = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+def extract_meta(soup: BeautifulSoup) -> Tuple[str,str]:
+    mt = soup.find("meta", attrs={"property":"og:title"}) or soup.find("meta", attrs={"name":"title"})
+    md = soup.find("meta", attrs={"name":"description"}) or soup.find("meta", attrs={"property":"og:description"})
     return (clean_text(mt["content"]) if mt and mt.has_attr("content") else "",
             clean_text(md["content"]) if md and md.has_attr("content") else "")
 
 def is_relevant(text: str) -> bool:
     t = text.lower()
     hits = sum(1 for kw in KEYWORDS if kw in t)
-    return hits >= 1  # ajuste à 2 pour plus de précision
+    return hits >= 1
 
 # -----------------------------
-# Découverte d’URLs
+# Parsing de la LISTE (carte par carte)
 # -----------------------------
-def get_sitemap_urls() -> List[str]:
-    urls = []
-    for sm in ["/sitemap.xml", "/sitemap_index.xml"]:
-        sitemap_url = urllib.parse.urljoin(BASE_URL, sm)
-        r = fetch(sitemap_url)
-        if not r or not r.ok or "xml" not in r.headers.get("Content-Type", ""):
-            continue
-        soup = BeautifulSoup(r.text, "lxml-xml")
-        locs = [loc.text.strip() for loc in soup.find_all("loc")]
-
-        # Si index de sitemaps, ouvrir chaque sous-sitemap
-        if any(x.endswith(".xml") for x in locs):
-            for sub in locs:
-                rr = fetch(sub)
-                if not rr or not rr.ok:
-                    continue
-                s2 = BeautifulSoup(rr.text, "lxml-xml")
-                for loc in s2.find_all("loc"):
-                    u = loc.text.strip()
-                    urls.append(u)
-        else:
-            urls.extend(locs)
-
-    # Filtrer pour ne garder que les pages liées aux publications/research
-    candidates = []
-    for u in urls:
-        if any(p.strip("/") in u for p in ["publications", "publication", "research", "papers", "paper"]):
-            candidates.append(u)
-    return sorted(set(candidates))
-
-def gather_candidate_urls() -> List[str]:
-    candidates = set()
-
-    # 1) via sitemaps
-    for u in get_sitemap_urls():
-        candidates.add(u)
-
-    # 2) via pages d’index si autorisées
-    for path in PUBLICATION_PATHS:
-        path = path.strip()
-        if not path:
-            continue
-        index_url = urllib.parse.urljoin(BASE_URL, path)
-        allowed, rule = can_fetch_robots(index_url)
-        if not allowed:
-            IGNORED_BY_ROBOTS.append({
-                "url": index_url,
-                "reason": "robots.txt disallow",
-                "matched_rule": rule or "",
-                "checked_at_utc": datetime.utcnow().isoformat(timespec="seconds"),
-            })
-            continue
-
-        r = fetch(index_url)
-        if not r or not r.ok:
-            continue
-        soup = BeautifulSoup(r.text, "lxml")
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if href.startswith("#"):
-                continue
-            u = urllib.parse.urljoin(index_url, href)
-            if any(k in u for k in ["/publications/", "/publication/", "/research/", "/papers/", "/paper/"]):
-                candidates.add(u)
-
-        # Pagination simple rel=next
-        next_link = soup.find("a", attrs={"rel": "next"}) or soup.find("link", attrs={"rel": "next"})
-        page_guard = 0
-        while next_link and page_guard < 50:
-            next_url = next_link.get("href")
-            if not next_url:
-                break
-            next_url = urllib.parse.urljoin(index_url, next_url)
-            allowed, rule = can_fetch_robots(next_url)
-            if not allowed:
-                IGNORED_BY_ROBOTS.append({
-                    "url": next_url,
-                    "reason": "robots.txt disallow",
-                    "matched_rule": rule or "",
-                    "checked_at_utc": datetime.utcnow().isoformat(timespec="seconds"),
-                })
-                break
-            rr = fetch(next_url)
-            if not rr or not rr.ok:
-                break
-            soup = BeautifulSoup(rr.text, "lxml")
-            for a in soup.find_all("a", href=True):
-                u = urllib.parse.urljoin(next_url, a["href"])
-                if any(k in u for k in ["/publications/", "/publication/", "/research/", "/papers/", "/paper/"]):
-                    candidates.add(u)
-            next_link = soup.find("a", attrs={"rel": "next"}) or soup.find("link", attrs={"rel": "next"})
-            page_guard += 1
-            polite_sleep()
-
-    return sorted(candidates)
-
-# -----------------------------
-# Parsing de page publication
-# -----------------------------
-def parse_publication_page(url: str) -> Dict[str, str]:
-    r = fetch(url)
-    data = {c: "" for c in COLUMNS}
-    data["url"] = url
-
-    if not r or not r.ok:
-        return data
-
-    soup = BeautifulSoup(r.text, "lxml")
-
-    # Titre / meta
-    h1 = soup.find(["h1", "h2"])
-    title = clean_text(h1.get_text()) if h1 else ""
-    meta_title, meta_desc = extract_meta(soup)
-
-    # Contenu brut
-    raw_text = clean_text(soup.get_text(" "))
-    data["raw_text_length"] = str(len(raw_text))
-    data["page_h1"] = title
-    data["page_meta_title"] = meta_title
-    data["page_meta_desc"] = meta_desc
-
-    # DOI
-    m_doi = re.search(r"\b10\.\d{4,9}/[-._;()/:A-Za-z0-9]+\b", raw_text)
-    data["doi"] = m_doi.group(0) if m_doi else ""
-
-    # PDF / Code links
+def detect_last_page(soup: BeautifulSoup) -> Optional[int]:
+    # Cherche un libellé "Last page NNN" visible dans le pager
+    pager_text = soup.get_text(" ")
+    m = re.search(r"Last page\s+(\d{1,4})", pager_text, flags=re.I)
+    if m:
+        try:
+            return int(m.group(1))
+        except:
+            return None
+    # Fallback: chercher ?page=XYZ dans les liens
+    pages = []
     for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        text_a = a.get_text(" ").strip().lower()
-        if href.lower().endswith(".pdf") or "pdf" in text_a:
-            data["pdf_url"] = urllib.parse.urljoin(url, href)
-        if any(x in href.lower() for x in ["github.com", "gitlab.com", "code", "source"]):
-            data["code_url"] = urllib.parse.urljoin(url, href)
+        href = a["href"]
+        if "publications?page=" in href:
+            try:
+                q = urllib.parse.urlparse(href).query
+                page = dict(urllib.parse.parse_qsl(q)).get("page")
+                if page is not None:
+                    pages.append(int(page))
+            except:
+                pass
+    return max(pages) if pages else None
 
-    # Date/Année
-    m_date = re.search(r"\b(20\d{2}|19\d{2})[-/\.](0?[1-9]|1[0-2])[-/\.](0?[1-9]|[12]\d|3[01])\b", raw_text)
-    if m_date:
-        data["date"] = m_date.group(0)
-        data["year"] = m_date.group(1)
-    else:
-        m_year = re.search(r"\b(20\d{2}|19\d{2})\b", raw_text)
-        data["year"] = m_year.group(1) if m_year else ""
-
-    # Auteurs (heuristique simple)
-    authors = ""
-    author_labels = soup.find_all(string=re.compile(r"^(Authors?|Auteurs?)\b", re.I))
-    for lbl in author_labels:
-        parent = lbl.parent
-        if parent:
-            txt = clean_text(parent.get_text(" "))
-            m = re.search(r"(Authors?|Auteurs?):\s*(.+)", txt, re.I)
-            if m:
-                authors = m.group(2)
-                break
-    data["authors"] = authors
-
-    # Tags (badges usuels)
-    tags = []
-    for tag in soup.select(".tag, .badge, .label, .chip"):
-        tt = clean_text(tag.get_text())
-        if tt:
-            tags.append(tt)
-    data["tags"] = ", ".join(sorted(set(tags))) if tags else ""
-
-    # Type / langue / slug / venue
-    parsed = urllib.parse.urlparse(url)
-    slug = parsed.path.strip("/")
-    data["slug"] = slug
-    data["language"] = guess_language_from_path(parsed.path) or ""
-
-    m_venue = re.search(r"(Published in|In:)\s*([A-Za-z0-9 \-–:]+)", raw_text, re.I)
-    data["venue"] = m_venue.group(2).strip() if m_venue else ""
-
-    # Abstract
-    abstract = ""
-    abs_hdr = soup.find(string=re.compile(r"^(Abstract|Résumé)\b", re.I))
-    if abs_hdr and abs_hdr.parent:
-        nxt = abs_hdr.parent.find_next("p")
-        if nxt:
-            abstract = clean_text(nxt.get_text(" "))
-    if not abstract:
-        for p in soup.find_all("p"):
-            txt = clean_text(p.get_text(" "))
-            if len(txt) > 160:
-                abstract = txt
-                break
-    data["abstract"] = abstract
-
-    data["title"] = title or meta_title
-
-    # Type ultra-heuristique
-    if any(x in slug for x in ["blog", "news"]):
-        data["type"] = "post"
-    elif any(x in slug for x in ["publication", "paper"]):
-        data["type"] = "paper"
-    else:
-        data["type"] = ""
-
-    return data
-
-# -----------------------------
-# Main
-# -----------------------------
-def _write_empty_outputs():
-    # CSV robots
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-    if IGNORED_BY_ROBOTS:
-        pd.DataFrame(IGNORED_BY_ROBOTS).to_csv(OUTPUT_IGNORED, index=False)
-    else:
-        pd.DataFrame(columns=["url", "reason", "matched_rule", "checked_at_utc"]).to_csv(OUTPUT_IGNORED, index=False)
-    # Excel
-    pd.DataFrame(columns=COLUMNS).to_excel(OUTPUT_XLSX, index=False)
-
-def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-    # Charger robots.txt une fois
-    load_robots()
-
-    print(f"[i] Base URL: {BASE_URL}")
-    print(f"[i] Publication paths: {PUBLICATION_PATHS}")
-    print("[i] Collecte des URLs candidates…")
-
-    urls = gather_candidate_urls()
-    urls = [u for u in urls if u.startswith(BASE_URL)]
-    urls = sorted(set(urls))
-
-    print(f"[i] {len(urls)} URLs candidates trouvées.")
-
+def parse_list_items(list_url: str, soup: BeautifulSoup) -> List[Dict[str,str]]:
     rows = []
-    for url in tqdm(urls, desc="Analyse des pages"):
+    # Heuristiques robustes pour trouver les cartes:
+    containers = []
+    # 1) balises article
+    containers.extend(soup.find_all(["article"]))
+    # 2) blocs div avec classes usuelles
+    containers.extend(soup.select("div.views-row, div.node--type-publication, div.view-content > div"))
+    # dédupliquer
+    containers = list(dict.fromkeys(containers))
+
+    for box in containers:
+        text = clean_text(box.get_text(" "))
+        if len(text) < 40:  # évite les éléments de menu, brèves, etc.
+            continue
+
+        # Titre: premier h2/h3/h1 raisonnable
+        h = box.find(["h2","h3","h1"])
+        title = clean_text(h.get_text()) if h else ""
+        if not title:
+            # parfois le titre est un <a> fort
+            a_title = box.find("a")
+            if a_title:
+                title = clean_text(a_title.get_text())
+
+        # Auteurs: heuristique — lignes de noms propres proches du titre
+        authors = []
+        # liens d'auteurs cliquables ou lignes juste après le titre
+        for a in box.find_all("a", href=True):
+            # exclure liens génériques (pager, social, menu)
+            if any(k in a["href"] for k in ["/news","/about","/research/publications", "/en/", "/fr/"]):
+                continue
+            # si le texte ressemble à un nom court, on le garde
+            t = clean_text(a.get_text())
+            if 1 <= t.count(" ") <= 3 and len(t) <= 40:
+                authors.append(t)
+        authors = ", ".join(dict.fromkeys([a for a in authors if a]))
+
+        # DOI / arXiv / PDF
+        doi = ""
+        pdf_url = ""
+        code_url = ""
+        for a in box.find_all("a", href=True):
+            href = a["href"].strip()
+            if "doi.org" in href:
+                doi = href
+            if "arxiv.org" in href:
+                pdf_url = href  # on place arXiv comme PDF/landing
+            if href.lower().endswith(".pdf") and not pdf_url:
+                pdf_url = urllib.parse.urljoin(list_url, href)
+            if any(x in href.lower() for x in ["github.com","gitlab.com","code","source"]):
+                code_url = href
+
+        # Date & venue (souvent une ligne séparée)
+        # ex: "2025-10-02" puis "ArXiv (preprint)" ou "IEEE ... (published)"
+        m_date = re.search(r"\b(20\d{2}|19\d{2})-(0?[1-9]|1[0-2])-(0?[1-9]|[12]\d|3[01])\b", text)
+        date = m_date.group(0) if m_date else ""
+        year = m_date.group(1) if m_date else (re.search(r"\b(20\d{2}|19\d{2})\b", text).group(1) if re.search(r"\b(20\d{2}|19\d{2})\b", text) else "")
+
+        # Venue: après la date, essayer de capter la ligne suivante entre la date et le lien DOI
+        venue = ""
+        if date:
+            # coupe le texte autour de la date
+            parts = text.split(date, 1)
+            tail = parts[1] if len(parts) > 1 else ""
+            # premier segment "propre"
+            m_venue = re.search(r"([A-Za-z0-9][A-Za-z0-9 \-–&,:()]+)", tail)
+            if m_venue:
+                venue = clean_text(m_venue.group(1))
+                # nettoyer parenthèses décoratives
+                venue = re.sub(r"\s{2,}", " ", venue)
+
+        # Type
+        _type = ""
+        if "preprint" in text.lower() or "arxiv" in text.lower():
+            _type = "preprint"
+        if "published" in text.lower():
+            _type = "published"
+
+        # Abstract court: chercher un blurb de 200–800 chars
+        abstract = ""
+        for p in box.find_all("p"):
+            pt = clean_text(p.get_text(" "))
+            if 160 <= len(pt) <= 800:
+                abstract = pt
+                break
+        if not abstract:
+            # fallback: tronquer le texte total
+            abstract = (text[:600] + "…") if len(text) > 600 else text
+
+        # Slug/URL (la liste n’a pas forcément de page-détail par article)
+        parsed = urllib.parse.urlparse(list_url)
+        lang = guess_language_from_path(parsed.path) or ""
+        slug = (parsed.path.strip("/") + ("?" + parsed.query if parsed.query else ""))
+        url = list_url  # on laisse l’URL liste; les liens externes (doi/arxiv) sont fournis
+
+        row = {
+            "title": title,
+            "authors": authors,
+            "year": year,
+            "date": date,
+            "venue": venue,
+            "type": _type,
+            "tags": "",
+            "abstract": abstract,
+            "doi": doi,
+            "pdf_url": pdf_url,
+            "code_url": code_url,
+            "language": lang,
+            "url": url,
+            "slug": slug,
+            "page_h1": "Publications",
+            "page_meta_title": "",
+            "page_meta_desc": "",
+            "raw_text_length": str(len(text)),
+        }
+
+        # pertinence (titre + abstract + venue)
+        hay = " ".join([row["title"], row["abstract"], row["venue"]])
+        if is_relevant(hay):
+            rows.append(row)
+
+    return rows
+
+def scrape_publications_list(start_url: str) -> List[Dict[str,str]]:
+    out = []
+    resp = fetch(start_url)
+    if not resp or not resp.ok:
+        return out
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    # Meta (non critique)
+    mt, md = extract_meta(soup)
+
+    # Pagination
+    last_page = detect_last_page(soup) or 1
+    # Sécurité: éviter d'exploser le runner
+    last_page = min(last_page, MAX_PAGES_HARD_CAP)
+
+    # Page 1
+    out.extend(parse_list_items(start_url, soup))
+
+    # Pages suivantes
+    for page in tqdm(range(2, last_page + 1), desc="Pagination"):
+        url = f"{start_url}?page={page}"
         allowed, rule = can_fetch_robots(url)
         if not allowed:
             IGNORED_BY_ROBOTS.append({
@@ -410,53 +336,76 @@ def main():
                 "checked_at_utc": datetime.utcnow().isoformat(timespec="seconds"),
             })
             continue
+        r = fetch(url)
+        if not r or not r.ok:
+            continue
+        soup = BeautifulSoup(r.text, "lxml")
+        out.extend(parse_list_items(url, soup))
+        polite_sleep()
+    return out
 
-        data = parse_publication_page(url)
+# -----------------------------
+# Main
+# -----------------------------
+def _write_empty_outputs():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    pd.DataFrame(columns=["url", "reason", "matched_rule", "checked_at_utc"]).to_csv(OUTPUT_IGNORED, index=False)
+    pd.DataFrame(columns=COLUMNS).to_excel(OUTPUT_XLSX, index=False)
 
-        hay = " ".join([
-            data.get("title", ""),
-            data.get("page_meta_title", ""),
-            data.get("page_meta_desc", ""),
-            data.get("abstract", "")
-        ])
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    load_robots()
 
-        if is_relevant(hay):
-            rows.append(data)
+    all_rows: List[Dict[str,str]] = []
+    for path in LIST_PATHS:
+        path = path.strip()
+        if not path:
+            continue
+        list_url = urllib.parse.urljoin(BASE_URL, path)
+        allowed, rule = can_fetch_robots(list_url)
+        if not allowed:
+            IGNORED_BY_ROBOTS.append({
+                "url": list_url,
+                "reason": "robots.txt disallow",
+                "matched_rule": rule or "",
+                "checked_at_utc": datetime.utcnow().isoformat(timespec="seconds"),
+            })
+            continue
+        rows = scrape_publications_list(list_url)
+        all_rows.extend(rows)
 
-        polite_sleep(0.5, 1.2)
-
-    print(f"[i] {len(rows)} pages pertinentes conservées.")
-
-    # Export journal robots (toujours créer le CSV)
+    # Export robots (toujours)
     if IGNORED_BY_ROBOTS:
         pd.DataFrame(IGNORED_BY_ROBOTS).to_csv(OUTPUT_IGNORED, index=False)
     else:
         pd.DataFrame(columns=["url", "reason", "matched_rule", "checked_at_utc"]).to_csv(OUTPUT_IGNORED, index=False)
-    print(f"[✓] Journal robots: {OUTPUT_IGNORED}")
 
     # Export Excel
-    if not rows:
+    if not all_rows:
         df = pd.DataFrame(columns=COLUMNS)
     else:
-        df = pd.DataFrame(rows)[COLUMNS]
-        df.drop_duplicates(subset=["url"], inplace=True, ignore_index=True)
-        if "title" in df.columns:
-            df["title"] = df["title"].fillna("").str.strip()
+        df = pd.DataFrame(all_rows)
+        # garder colonnes d’intérêt
+        for c in COLUMNS:
+            if c not in df.columns:
+                df[c] = ""
+        df = df[COLUMNS]
+        df.drop_duplicates(subset=["title","date","venue","doi"], inplace=True, ignore_index=True)
 
     df.to_excel(OUTPUT_XLSX, index=False)
-    print(f"[✓] Export terminé: {OUTPUT_XLSX}")
+    print(f"[✓] Export: {OUTPUT_XLSX}")
+    print(f"[i] Rows: {len(df)} | Robots ignored: {len(IGNORED_BY_ROBOTS)}")
 
 if __name__ == "__main__":
     try:
         main()
         sys.exit(0)
     except Exception as e:
-        # journalise l'erreur et produit des fichiers vides pour ne pas casser le pipeline
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         with open(OUTPUT_ERRLOG, "w", encoding="utf-8") as f:
             f.write(f"[{datetime.utcnow().isoformat(timespec='seconds')}] {type(e).__name__}: {e}\n")
             f.write("\nTraceback:\n")
             f.write(traceback.format_exc())
         _write_empty_outputs()
-        print(f"[!] Erreur capturée: {e}. Voir {OUTPUT_ERRLOG}")
-        sys.exit(0)  # <-- IMPORTANT: ne fait pas échouer le job
+        print(f"[!] Error captured: {e}. See {OUTPUT_ERRLOG}")
+        sys.exit(0)
