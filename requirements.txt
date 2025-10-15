@@ -1,6 +1,6 @@
-requests
-beautifulsoup4
-lxml
-pandas
-openpyxl
-tqdm
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=5.1
+pandas>=2.2
+openpyxl>=3.1
+tqdm>=4.66
