@@ -7,6 +7,7 @@ Scraper MILA publications -> Excel (sans lxml)
 - Pagination auto (détectée) avec limite MAX_PAGES_HARD_CAP
 - Parser principal (cartes) + fallback en découpant par dates si besoin
 - Score de pertinence + 2 onglets Excel: filtered / all
+- NEW: colonne 'matched_keywords' listant les mots-clés qui ont matché
 - Toujours écrire ignored_by_robots.csv (même vide)
 - Fail-soft: si erreur, log dans data/scrape_error.log, sortie code 0
 """
@@ -34,10 +35,11 @@ OUTPUT_XLSX = os.environ.get("OUTPUT_XLSX", os.path.join(OUTPUT_DIR, "mila_publi
 OUTPUT_IGNORED = os.path.join(OUTPUT_DIR, "ignored_by_robots.csv")
 OUTPUT_ERRLOG = os.path.join(OUTPUT_DIR, "scrape_error.log")
 
-DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MILA-Publication-Research/2.2; +https://github.com/your-org/your-repo)"}
+DEFAULT_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MILA-Publication-Research/2.3; +https://github.com/your-org/your-repo)"}
 TIMEOUT = 30
 MAX_RETRIES = 3
 MAX_PAGES_HARD_CAP = int(os.environ.get("MAX_PAGES_HARD_CAP", "60"))
+RELEVANCE_MIN_HITS = int(os.environ.get("RELEVANCE_MIN_HITS", "1"))
 
 # -----------------------------
 # Thématique & scoring
@@ -63,11 +65,11 @@ KEYWORDS = [kw.lower() for kw in [
     "llm", "foundation model", "multimodal", "self-supervised", "few-shot",
     "federated learning", "differential privacy", "interpretability"
 ]]
-RELEVANCE_MIN_HITS = int(os.environ.get("RELEVANCE_MIN_HITS", "1"))
 
 COLUMNS = [
     "title","authors","year","date","venue","type","tags","abstract","doi","pdf_url","code_url",
-    "language","url","slug","page_h1","page_meta_title","page_meta_desc","raw_text_length","relevance_score"
+    "language","url","slug","page_h1","page_meta_title","page_meta_desc","raw_text_length",
+    "relevance_score","matched_keywords"  # NEW
 ]
 
 # -----------------------------
@@ -129,7 +131,7 @@ def can_fetch_robots(url: str) -> Tuple[bool, Optional[str]]:
         return (True, None)
 
 # -----------------------------
-# Utils parsing
+# Utils parsing & relevance
 # -----------------------------
 DATE_RX = re.compile(r"\b(20\d{2}|19\d{2})-(0?[1-9]|1[0-2])-(0?[1-9]|[12]\d|3[01])\b")
 
@@ -143,15 +145,16 @@ def clean_text(s: Optional[str]) -> str:
     if not s: return ""
     return re.sub(r"\s+", " ", s).strip()
 
-def relevance_score(text: str) -> int:
+def find_keyword_hits(text: str) -> list[str]:
+    """Return a de-duplicated, sorted list of keywords that appear in text."""
     t = text.lower()
-    return sum(1 for kw in KEYWORDS if kw in t)
+    return sorted({kw for kw in KEYWORDS if kw in t})
 
 # -----------------------------
 # Pagination & parsing
 # -----------------------------
 def detect_last_page(soup: BeautifulSoup) -> Optional[int]:
-    # Cherche 'Last page NNN' ou max de '?page='
+    # Try 'Last page NNN' or take max from '?page=' links
     text = soup.get_text(" ")
     m = re.search(r"Last page\s+(\d{1,4})", text, flags=re.I)
     if m:
@@ -229,20 +232,23 @@ def parse_cards(list_url: str, soup: BeautifulSoup) -> List[Dict[str,str]]:
         if key in seen: continue
         seen.add(key)
 
-        score = relevance_score(" ".join([title, abstract, venue]))
+        hay = " ".join([title, abstract, venue])
+        hits = find_keyword_hits(hay)
+        score = len(hits)
+
         rows.append({
             "title": title, "authors": authors, "year": year, "date": date, "venue": venue, "type": ptype,
             "tags": "", "abstract": abstract, "doi": doi, "pdf_url": pdf_url, "code_url": code_url,
             "language": lang, "url": url, "slug": slug, "page_h1": "Publications",
             "page_meta_title": "", "page_meta_desc": "", "raw_text_length": str(len(txt)),
-            "relevance_score": score
+            "relevance_score": score, "matched_keywords": ", ".join(hits)
         })
     return rows
 
 def parse_blocks(list_url: str, soup: BeautifulSoup) -> List[Dict[str,str]]:
     rows = []
     text = clean_text(soup.get_text(" "))
-    parts = re.split(r"(?=(?:^|\s)(?:19|20)\d{2}-\d{1,2}-\d{1,2})", text)  # découpe sur dates
+    parts = re.split(r"(?=(?:^|\s)(?:19|20)\d{2}-\d{1,2}-\d{1,2})", text)  # split on dates
     lang = guess_language_from_path(urllib.parse.urlparse(list_url).path)
     slug = urllib.parse.urlparse(list_url).path.strip("/") + (("?"+urllib.parse.urlparse(list_url).query) if urllib.parse.urlparse(list_url).query else "")
     url = list_url
@@ -254,7 +260,7 @@ def parse_blocks(list_url: str, soup: BeautifulSoup) -> List[Dict[str,str]]:
         date = m_date.group(0) if m_date else ""
         year = m_date.group(1) if m_date else (re.search(r"\b(20\d{2}|19\d{2})\b", chunk).group(1) if re.search(r"\b(20\d{2}|19\d{2})\b", chunk) else "")
 
-        # Titre = 1re phrase potable avant la date
+        # Title = 1st decent phrase before date
         title = ""
         if m_date:
             head = chunk[:m_date.start()]
@@ -272,7 +278,7 @@ def parse_blocks(list_url: str, soup: BeautifulSoup) -> List[Dict[str,str]]:
         low = chunk.lower()
         ptype = "preprint" if ("preprint" in low or "arxiv" in low) else ("published" if "published" in low else "")
 
-        # Liens globaux (simplifié)
+        # Simplified link scan (global)
         doi = ""; pdf_url = ""; code_url = ""
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
@@ -282,14 +288,17 @@ def parse_blocks(list_url: str, soup: BeautifulSoup) -> List[Dict[str,str]]:
             if any(x in href.lower() for x in ["github.com","gitlab.com","code","source"]): code_url = href
 
         abstract = chunk if len(chunk) <= 600 else (chunk[:600] + "…")
-        score = relevance_score(" ".join([title, abstract, venue]))
+
+        hay = " ".join([title, abstract, venue])
+        hits = find_keyword_hits(hay)
+        score = len(hits)
 
         rows.append({
             "title": title, "authors": "", "year": year, "date": date, "venue": venue, "type": ptype,
             "tags": "", "abstract": abstract, "doi": doi, "pdf_url": pdf_url, "code_url": code_url,
             "language": lang, "url": url, "slug": slug, "page_h1": "Publications",
             "page_meta_title": "", "page_meta_desc": "", "raw_text_length": str(len(chunk)),
-            "relevance_score": score
+            "relevance_score": score, "matched_keywords": ", ".join(hits)
         })
     return rows
 
@@ -309,7 +318,7 @@ def scrape_publications_list(start_url: str) -> List[Dict[str,str]]:
         rows = parse_blocks(start_url, soup)
     out.extend(rows)
 
-    # Pages suivantes
+    # Next pages
     for page in tqdm(range(2, last_page + 1), desc=f"Paginate {start_url}"):
         url = f"{start_url}?page={page}"
         allowed, rule = can_fetch_robots(url)
@@ -360,22 +369,24 @@ def main():
             continue
         all_rows.extend(scrape_publications_list(list_url))
 
-    # Export robots (toujours)
+    # Export robots (always)
     if IGNORED_BY_ROBOTS:
         pd.DataFrame(IGNORED_BY_ROBOTS).to_csv(OUTPUT_IGNORED, index=False)
     else:
         pd.DataFrame(columns=["url","reason","matched_rule","checked_at_utc"]).to_csv(OUTPUT_IGNORED, index=False)
 
-    # Excel 2 onglets
+    # Excel (2 sheets)
     if not all_rows:
         filtered = pd.DataFrame(columns=COLUMNS)
         full = pd.DataFrame(columns=COLUMNS)
     else:
         full = pd.DataFrame(all_rows)
+        # ensure columns & order
         for c in COLUMNS:
             if c not in full.columns: full[c] = ""
         full = full[COLUMNS]
         full.drop_duplicates(subset=["title","date","venue","doi"], inplace=True, ignore_index=True)
+        # filter by relevance
         filtered = full[full["relevance_score"] >= RELEVANCE_MIN_HITS].copy()
 
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as xw:
